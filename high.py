@@ -17,6 +17,7 @@ import logging
 import time
 import signal
 from selenium.webdriver.common.action_chains import ActionChains
+from concurrent.futures import ThreadPoolExecutor
 
 # Настройка логирования
 logging.basicConfig(
@@ -30,6 +31,7 @@ def show_help():
     print("Polecenia:")
     print("  run     - Uruchomienie skryptu do scrapowania danych.")
     print("  help    - Wyświetlenie tego komunikatu pomocy.")
+
 def download_image(url, folder, filename):
     """Скачивает изображение из URL и сохраняет его в указанной папке."""
     try:
@@ -84,12 +86,19 @@ def scrape_nga_highlights(driver):
 
     return image_data
 
-def scrape_artwork_details(driver, art_object_url):
+def scrape_artwork_details(art_object_url):
     """Извлекает детальную информацию о произведении искусства из HTML-кода,
     включая открытие скрытых вкладок."""
+    options = webdriver.ChromeOptions()
+    options.add_argument("--disable-gpu")
+    options.add_argument("--no-sandbox")
+    options.add_argument("--headless") # Добавляем headless режим
+    
+    driver = webdriver.Chrome(options=options)
+    driver.implicitly_wait(5) # Уменьшаем время ожидания
 
     driver.get(art_object_url)
-    wait = WebDriverWait(driver, 20)
+    wait = WebDriverWait(driver, 10) # Уменьшаем время ожидания
     soup = BeautifulSoup(driver.page_source, "html.parser")
 
     artwork_data = {}
@@ -119,6 +128,7 @@ def scrape_artwork_details(driver, art_object_url):
     custom_prints_element = soup.select_one(".object-attr.prints .object-attr-value a")
     artwork_data["custom_prints_link"] = custom_prints_element["href"] if custom_prints_element else None
     artwork_data["copyright"] = extract_text_or_none(soup.select_one(".object-attr.copyright .object-attr-value"))
+    artwork_data["signature:"] = None # Добавляем поле "signature:" со значением None
 
     # Кликаем по кнопкам, чтобы открыть вкладки
     buttons_to_click = [
@@ -133,20 +143,16 @@ def scrape_artwork_details(driver, art_object_url):
 
     for button_id in buttons_to_click:
         try:
-            button = wait.until(EC.visibility_of_element_located((By.ID, button_id)))
-            # Прокрутка до элемента
-            actions = ActionChains(driver)
-            actions.move_to_element(button).perform()
-
+            button = wait.until(EC.presence_of_element_located((By.ID, button_id)))
             driver.execute_script("arguments[0].click();", button)
-            time.sleep(0.5)
+
         except (NoSuchElementException, TimeoutException, ElementClickInterceptedException) as e:
-            logging.warning(f"Не удалось кликнуть на кнопку {button_id}: {e}")
+            logging.debug(f"Не удалось кликнуть на кнопку {button_id}: {e}")
 
     # Обновляем soup после кликов по кнопкам
     soup = BeautifulSoup(driver.page_source, "html.parser")
 
-  # Извлекаем провенанс (Provenance)
+    # Извлекаем провенанс (Provenance)
     provenance_text = []
     provenance_div = soup.find('div', id='provenance')
     if provenance_div:
@@ -226,16 +232,12 @@ def scrape_artwork_details(driver, art_object_url):
     if image_description_div:
         # Открываем вкладку с описанием изображения, если она есть
         try:
-            button = wait.until(EC.visibility_of_element_located((By.ID, "drawer-control-0")))
-            actions = ActionChains(driver)
-            actions.move_to_element(button).perform()
+            button = wait.until(EC.presence_of_element_located((By.ID, "drawer-control-0")))
             driver.execute_script("arguments[0].click();", button)
-            time.sleep(0.5)
-            # Обновляем soup после клика
             soup = BeautifulSoup(driver.page_source, "html.parser")
             image_description_div = soup.find('div', class_='drawer-alttext')  # Ищем заново после обновления
         except (NoSuchElementException, TimeoutException, ElementClickInterceptedException) as e:
-            logging.warning(f"Не удалось кликнуть на кнопку описания изображения: {e}")
+            logging.debug(f"Не удалось кликнуть на кнопку описания изображения: {e}")
 
         content_div = image_description_div.find('div', id='drawer-content-0')
         if content_div:
@@ -302,7 +304,69 @@ def scrape_artwork_details(driver, art_object_url):
                 technical_summary_list.append(p.get_text(strip=True))
     artwork_data["technical_summary"] = technical_summary_list
 
+    driver.quit()
     return artwork_data
+
+def scrape_page(driver, page_num, artwork_counter, image_folder, max_workers=5):
+    """Скрапит отдельную страницу и возвращает список произведений искусства."""
+    logging.info(f"Обработка страницы {page_num}...")
+    wait = WebDriverWait(driver, 40)
+
+    try:
+        wait.until(EC.presence_of_element_located((By.CSS_SELECTOR, "ul.returns")))
+        scraped_data = scrape_nga_highlights(driver)
+
+        if not scraped_data:
+            logging.warning("Не удалось получить данные со страницы.")
+            return [], artwork_counter
+
+        page_artworks = []
+        with ThreadPoolExecutor(max_workers=max_workers) as executor:
+            futures = []
+            for item in scraped_data:
+                artwork_info = {
+                    "id": artwork_counter,
+                    "link_to_the_page_of_the_work": item.get("link_to_the_page_of_the_work"),
+                    "image_url": item.get("image_url"),
+                }
+
+                if item["link_to_the_page_of_the_work"]:
+                    future = executor.submit(scrape_artwork_details, item["link_to_the_page_of_the_work"])
+                    futures.append((future, artwork_info, item.get("image_url")))
+
+                artwork_counter += 1
+
+            for future, artwork_info, image_url in futures:
+                try:
+                    artwork_details = future.result()
+                    artwork_info.update(artwork_details)
+
+                    # Заменяем пустые значения на None, а пустые списки на []
+                    for key, value in artwork_info.items():
+                        if value == '':
+                            artwork_info[key] = None
+
+                except requests.exceptions.RequestException as e:
+                    logging.error(
+                        f"Ошибка при запросе страницы {artwork_info['link_to_the_page_of_the_work']}: {e}"
+                    )
+
+                page_artworks.append(artwork_info)
+
+                if image_url:
+                    image_filename = f"{artwork_info['id']}.jpg"
+                    if download_image(image_url, image_folder, image_filename):
+                        logging.info(
+                            f"Скачано изображение {image_filename} со страницы {page_num}"
+                        )
+                    else:
+                        logging.error(f"Не удалось скачать изображение для произведения с ID {artwork_info['id']}")
+
+        return page_artworks, artwork_counter
+
+    except Exception as e:
+        logging.error(f"Произошла ошибка на странице {page_num}: {e}")
+        return [], artwork_counter
 
 def signal_handler(signum, frame):
     """Обработчик сигнала для прерывания цикла."""
@@ -317,17 +381,18 @@ def run_scraper():
     signal.signal(signal.SIGINT, signal_handler)
 
     highlights_url = "https://www.nga.gov/collection/highlights.html"
+    max_pages = 10  # Указываем максимальное количество страниц
 
     options = webdriver.ChromeOptions()
     options.add_argument("--disable-gpu")
     options.add_argument("--no-sandbox")
-    # options.add_argument("--headless")  # Раскомментируйте для режима без графического интерфейса
+    # options.add_argument("--headless") # Раскомментируйте, если нужен headless режим для основного драйвера
 
     driver = webdriver.Chrome(options=options)
     driver.implicitly_wait(10)
     driver.get(highlights_url)
-    time.sleep(5)  # Начальная пауза для загрузки страницы
-    wait = WebDriverWait(driver, 40)
+    time.sleep(2)  # Уменьшаем начальную паузу
+    wait = WebDriverWait(driver, 20)
 
     all_artworks = []
     page_num = 1
@@ -337,73 +402,41 @@ def run_scraper():
     if not os.path.exists(image_folder):
         os.makedirs(image_folder)
 
-    while running:
-        logging.info(f"Обработка страницы {page_num}...")
+    while running and page_num <= max_pages:
+        page_artworks, artwork_counter = scrape_page(
+            driver, page_num, artwork_counter, image_folder
+        )
+        all_artworks.extend(page_artworks)
 
-        try:
-            wait.until(EC.presence_of_element_located((By.CSS_SELECTOR, "ul.returns")))
-            scraped_data = scrape_nga_highlights(driver)
+        with open("masterpieces_data_test.json", "w", encoding="utf-8") as json_file:
+            json.dump(all_artworks, json_file, indent=4, ensure_ascii=False)
+        logging.info(f"Данные со страницы {page_num} добавлены в masterpieces_data.json")
 
-            if not scraped_data:
-                logging.warning("Не удалось получить данные со страницы.")
-                break
-
-            page_artworks = []
-            for index, item in enumerate(scraped_data, start=1):
-
-                artwork_info = {
-                    "id": artwork_counter,
-                    "link_to_the_page_of_the_work": item.get("link_to_the_page_of_the_work"),
-                    "image_url": item.get("image_url"),
-                }
-
-                if item["link_to_the_page_of_the_work"]:
-                    try:
-                        artwork_details = scrape_artwork_details(driver, item["link_to_the_page_of_the_work"])
-                        artwork_info.update(artwork_details)
-
-                        # Заменяем пустые значения на None, а пустые списки на []
-                        for key, value in artwork_info.items():
-                            if value == '':
-                                artwork_info[key] = None
-
-                        time.sleep(3)
-                    except requests.exceptions.RequestException as e:
-                        logging.error(
-                            f"Ошибка при запросе страницы {item['link_to_the_page_of_the_work']}: {e}"
-                        )
-
-                page_artworks.append(artwork_info)
-
-                if item.get("image_url"):
-                    image_filename = f"{artwork_counter}.jpg"
-                    if download_image(item["image_url"], image_folder, image_filename):
-                        logging.info(
-                            f"Скачано изображение {image_filename} со страницы {page_num}"
-                        )
-                    else:
-                        logging.error(f"Не удалось скачать изображение для произведения с ID {artwork_counter}")
-                artwork_counter += 1
-
-            all_artworks.extend(page_artworks)
-
-            with open("masterpieces_data.json", "w", encoding="utf-8") as json_file:
-                json.dump(all_artworks, json_file, indent=4, ensure_ascii=False)
-            logging.info(f"Данные со страницы {page_num} добавлены в masterpieces_data.json")
-
-            # Переход на следующую страницу
+        # Переход на следующую страницу
+        if page_num < max_pages:
             try:
-                # Находим кнопку "Next"
-                next_button_xpath = "//li[@id='pageNext']/a"
+                # Ожидание появления списка
+                wait = WebDriverWait(driver, 10)
+                wait.until(
+                    EC.presence_of_element_located((By.XPATH, "/html/body/div[2]/div[1]/div[2]/div/div/div/div[3]/div/div/div[5]/div/ul"))
+                )
+                # Находим кнопку "Next" *после* загрузки страницы
+                next_button_xpath = "/html/body/div[2]/div[1]/div[2]/div/div/div/div[3]/div/div/div[5]/div/ul/li[4]/a/span"  # poprawiony xpath
                 next_button = wait.until(
                     EC.element_to_be_clickable((By.XPATH, next_button_xpath))
                 )
 
-                # Прокрутка к кнопке
-                driver.execute_script("arguments[0].scrollIntoView({block: 'center'});", next_button)
+                # Запоминаем текущий URL перед кликом, чтобы потом сравнить
+                current_url = driver.current_url
 
-                # Клик по кнопке "Next"
+                # Клик по кнопке "Next" с помощью JavaScript
                 driver.execute_script("arguments[0].click();", next_button)
+                # Ожидание обновления URL (zmiany strony)
+                wait.until(lambda driver: driver.current_url != current_url) 
+
+            except TimeoutException:
+                print(f"Не удалось найти кнопку 'Next' на странице {page_num + 1} или не произошло переключение страницы.")
+                break
 
                 # Ожидание обновления списка результатов
                 def list_updated(driver):
@@ -420,11 +453,12 @@ def run_scraper():
                 logging.info("Кнопка 'next' не найдена. Завершение.")
                 break
             except TimeoutException:
-                logging.error("Превышено время ожидания загрузки следующей страницы.")
+                logging.error(
+                    "Превышено время ожидания загрузки следующей страницы."
+                )
                 break
-
-        except Exception as e:
-            logging.error(f"Произошла ошибка на странице {page_num}: {e}")
+        else:
+            logging.info("Достигнута последняя страница.")
             break
 
     driver.quit()
